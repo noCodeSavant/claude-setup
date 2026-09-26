@@ -1,0 +1,17 @@
+# Allowlist: ignore everything, un-ignore only what's intentionally versioned.
+*
+!.gitignore
+!README.md
+!CLAUDE.md
+!settings.json
+!statusline.sh
+!agents/
+!agents/**
+!bin/
+!bin/**
+!commands/
+!commands/**
+!hooks/
+!hooks/**
+!skills/
+!skills/**

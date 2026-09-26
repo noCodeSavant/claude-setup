@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""ccs - browse and resume Claude Code sessions across all projects."""
+import json, os, shlex, shutil, subprocess, sys, time
+import re, glob
+from datetime import datetime, timezone
+from pathlib import Path
+
+WT = shutil.which("wt.exe")
+
+ROOT  = Path(os.environ.get("CCS_ROOT", Path.home() / ".claude" / "projects"))
+CACHE = Path.home() / ".cache" / "ccs" / "index.json"
+
+
+def load_cache():
+    try:
+        return json.loads(CACHE.read_text())
+    except Exception:
+        return {}
+
+
+def save_cache(c):
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        CACHE.write_text(json.dumps(c))
+    except Exception:
+        pass
+
+
+def first_text(msg):
+    """Pull plain text out of a message content field."""
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                return b["text"]
+    return ""
+
+
+def scan(path: Path, cache: dict):
+    """Extract session metadata, using mtime+size as the cache key."""
+    st  = path.stat()
+    key = str(path)
+    sig = f"{st.st_mtime_ns}:{st.st_size}"
+    hit = cache.get(key)
+    if hit and hit.get("sig") == sig:
+        return hit
+
+    title = cwd = branch = ""
+    prompt = ""
+    n_user = n_asst = 0
+    sidechain = False
+    last_ts = ""
+    entrypoint = ""
+    try:
+        with path.open(errors="replace") as fh:
+            for line in fh:
+                if '"ai-title"' in line:
+                    try:
+                        title = json.loads(line).get("aiTitle") or title
+                    except Exception:
+                        pass
+                    continue
+                if '"type":"user"' in line or '"type":"assistant"' in line:
+                    i = line.rfind('"timestamp":"')
+                    if i != -1:
+                        last_ts = line[i + 13:i + 33]
+                if '"type":"user"' in line:
+                    n_user += 1
+                    if not prompt:
+                        try:
+                            d = json.loads(line)
+                        except Exception:
+                            continue
+                        if d.get("isSidechain"):
+                            sidechain = True
+                        entrypoint = d.get("entrypoint") or ""
+                        cwd    = cwd or d.get("cwd", "")
+                        branch = branch or (d.get("gitBranch") or "")
+                        t = first_text(d.get("message", {})).strip()
+                        # skip system-injected/meta turns
+                        if t and not t.startswith(("<", "Caveat:")):
+                            prompt = " ".join(t.split())[:120]
+                elif '"type":"assistant"' in line:
+                    n_asst += 1
+                    if not cwd:
+                        try:
+                            cwd = json.loads(line).get("cwd", "") or cwd
+                        except Exception:
+                            pass
+    except OSError:
+        return None
+
+    mtime = st.st_mtime          # fallback; migrations/rewrites clobber mtime, records don't lie
+    try:
+        with path.open("rb") as fh:
+            fh.seek(max(0, st.st_size - 65536))
+            tail = fh.read().decode(errors="replace")
+        ts = re.findall(r'"timestamp":"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)', tail)
+        if ts:
+            mtime = datetime.strptime(ts[-1], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    except Exception:
+        pass
+    rec = {
+        "sig": sig, "sid": path.stem, "file": str(path),
+        "title": title or prompt or "(untitled)",
+        "prompt": prompt, "cwd": cwd, "branch": branch,
+        "mtime": mtime, "turns": n_user, "replies": n_asst,
+        "sidechain": sidechain, "entrypoint": entrypoint,
+    }
+    cache[key] = rec
+    return rec
+
+
+def ago(ts):
+    d = time.time() - ts
+    for unit, s in (("d", 86400), ("h", 3600), ("m", 60)):
+        if d >= s:
+            return f"{int(d // s)}{unit}"
+    return "now"
+
+
+
+BASE  = Path(os.environ.get("CCS_BASE", Path.home() / "projects"))
+PRUNE = {".git", "node_modules", ".next", ".nuxt", "dist", "build", ".venv", "venv", "__pycache__", ".cache", ".turbo", "coverage", "target"}
+
+def sanitize(p):
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(p))
+
+def project_rows():
+    """One "▸ new session" row per repo / workspace folder under $CCS_BASE (default ~/projects)."""
+    if not BASE.is_dir():
+        return []
+    repos = []
+    for dirpath, dirnames, _ in os.walk(BASE):
+        if ".git" in dirnames:
+            repos.append(Path(dirpath))
+        dirnames[:] = [d for d in dirnames if d not in PRUNE]
+    top = {BASE, BASE / "internal", BASE / "clients"}
+    if (BASE / "clients").is_dir():
+        top |= {c for c in (BASE / "clients").iterdir() if c.is_dir()}
+    cands = set(repos)
+    for dirpath, dirnames, _ in os.walk(BASE):   # folders that have Claude memory count too (e.g. a repo not cloned yet)
+        d = Path(dirpath)
+        if len(d.relative_to(BASE).parts) >= 4:
+            dirnames[:] = []; continue
+        dirnames[:] = [x for x in dirnames if x not in PRUNE and not x.startswith(".")]
+        if d not in (BASE, BASE / "internal", BASE / "clients") and (ROOT / sanitize(d) / "memory").is_dir():
+            cands.add(d)
+        elif d.parent in top and d not in top and (d / "CLAUDE.md").is_file():   # folder-only project (no repo, no memory yet)
+            cands.add(d)
+    for r in repos:                      # a repo's parent folder is a workspace unless it's a tree root
+        if r.parent not in top and BASE in r.parent.parents:
+            cands.add(r.parent)
+    rows = []
+    for path in sorted(cands):
+        mem = ROOT / sanitize(path) / "memory"
+        n = len(list(mem.glob("*.md"))) if mem.is_dir() else 0
+        br = ""
+        if (path / ".git").is_dir():
+            try:
+                br = subprocess.run(["git", "-C", str(path), "symbolic-ref", "--short", "HEAD"],
+                                    capture_output=True, text=True, timeout=3).stdout.strip()
+            except Exception:
+                pass
+        rows.append({"sid": "new:" + sanitize(path), "file": "", "cwd": str(path), "branch": br,
+                     "title": f"memory: {n} notes" if n else "", "prompt": "",
+                     "mtime": 0, "turns": 0, "replies": 0, "new": True,
+                     "entrypoint": "cli", "sidechain": False})
+    return rows
+
+def collect(show_all=False):
+    """Interactive sessions only, unless show_all: agent/sidechain transcripts are hidden."""
+    if not ROOT.is_dir():
+        return []
+    cache = load_cache()
+    out = [r for f in ROOT.rglob("*.jsonl") if (r := scan(f, cache))]
+    if not show_all:
+        out = [r for r in out
+               if not r.get("sidechain")
+               and r.get("entrypoint", "") in ("", "cli")   # sdk-cli = programmatic (claude -p, agents)
+               and r.get("turns", 0) > 0]
+    save_cache(cache)
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    have = {r["cwd"] for r in out}
+    out += [r for r in project_rows() if r["cwd"] not in have]   # projects with no session yet, at the bottom
+    return out
+
+
+def preview(arg):
+    """fzf preview: a session's tail, or a project's memory index for a '▸ new session' row."""
+    if arg.startswith("new:"):
+        mem = ROOT / arg[4:] / "memory" / "MEMORY.md"
+        print(mem.read_text() if mem.exists() else "No sessions or memory here yet — Enter starts a fresh one.")
+        return
+    file = arg
+    if not os.path.exists(file):
+        hits = glob.glob(str(ROOT / "*" / f"{arg}.jsonl"))
+        if not hits:
+            print("(no transcript found)"); return
+        file = hits[0]
+    """Render the tail of a conversation for fzf's preview pane."""
+    msgs = []
+    try:
+        with open(file, errors="replace") as fh:
+            for line in fh:
+                if '"type":"user"' not in line and '"type":"assistant"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                t = first_text(d.get("message", {})).strip()
+                if not t or t.startswith(("<", "Caveat:")):
+                    continue
+                who = "You" if d.get("type") == "user" else "Claude"
+                msgs.append((who, " ".join(t.split())))
+    except OSError as e:
+        print(f"(unreadable: {e})")
+        return
+    for who, text in msgs[-8:]:
+        mark = "\033[36m▸\033[0m" if who == "You" else "\033[35m◂\033[0m"
+        print(f"{mark} \033[1m{who}\033[0m: {text[:400]}")
+        print()
+
+
+def running_sids():
+    """Session ids that already have a live `claude --resume` process (never open them twice)."""
+    try:
+        out = subprocess.run(["pgrep", "-af", "claude"], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        return set()
+    return set(re.findall(r"--resume\s+([0-9a-f-]{36})", out))
+
+
+def restore_set(rows, hours=24.0):
+    """The sessions to bring back: the newest session of every project that saw activity in the
+    `hours` before the most recent activity anywhere (= your last working day)."""
+    real = [r for r in rows if not r.get("new") and r["cwd"] and os.path.isdir(r["cwd"])]
+    if not real:
+        return []
+    newest = max(r["mtime"] for r in real)
+    live = running_sids()
+    picked, seen = [], set()
+    for r in sorted(real, key=lambda r: r["mtime"], reverse=True):   # newest first
+        if newest - r["mtime"] > hours * 3600:
+            break
+        if r["cwd"] in seen or r["sid"] in live:
+            continue
+        seen.add(r["cwd"]); picked.append(r)
+    return picked
+
+
+def launch_many(recs):
+    """Open each session in its own Windows Terminal tab."""
+    if not WT:
+        print("restore needs Windows Terminal (wt.exe); open these by hand:", file=sys.stderr)
+        for r in recs:
+            print(f"  cd {shlex.quote(r['cwd'])} && claude --resume {r['sid']}")
+        return
+    for i, r in enumerate(recs):
+        launch(r, "tab")
+        if i < len(recs) - 1:
+            time.sleep(0.7)          # let wt.exe register each tab before the next
+
+
+def confirm_restore(recs, assume_yes=False):
+    if not recs:
+        print("nothing to restore: no recent sessions, or they are all running already.")
+        return False
+    print(f"{len(recs)} session(s) from your last working day:")
+    for r in recs:
+        print(f"  {ago(r['mtime']):>4}  {os.path.basename(r['cwd']):<22} {r['title'][:60]}")
+    if assume_yes:
+        return True
+    try:
+        return input("open them all in new tabs? [Y/n] ").strip().lower() in ("", "y", "yes")
+    except EOFError:
+        return False
+
+
+def launch(rec, mode):
+    """Open a session. mode: 'tab' | 'window' | 'here'.
+
+    'here' replaces this process (no return). 'tab'/'window' spawn a Windows
+    Terminal tab/window via wt.exe and return, so the picker survives.
+    """
+    sid, cwd = rec["sid"], rec["cwd"]
+    if not (cwd and os.path.isdir(cwd)):
+        print(f"warning: {cwd or '(unknown)'} no longer exists; using ~", file=sys.stderr)
+        cwd = os.path.expanduser("~")
+
+    resume = [] if sid.startswith("new:") else ["--resume", sid]
+    cmd = " ".join(["claude", *map(shlex.quote, resume)])
+
+    if mode == "here" or not WT:
+        os.chdir(cwd)
+        os.execvp("claude", ["claude", *resume])
+
+    subprocess.Popen(
+        [WT, "-w", "0" if mode == "tab" else "-1", "new-tab",
+         "--profile", "Ubuntu",
+         "--title", os.path.basename(cwd) or "claude",
+         "wsl.exe", "-d", "Ubuntu", "--cd", cwd, "--", "bash", "-lic", cmd],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+
+
+def main():
+    SELF = os.path.abspath(sys.argv[0])
+    if len(sys.argv) > 2 and sys.argv[1] == "--preview":
+        preview(sys.argv[2])
+        return
+
+    show_all = "--all" in sys.argv
+    if "--restore" in sys.argv:
+        i = sys.argv.index("--restore")
+        hours = float(sys.argv[i + 1]) if len(sys.argv) > i + 1 and re.fullmatch(r"[\d.]+", sys.argv[i + 1]) else 24.0
+        recs = restore_set(collect(), hours)
+        if confirm_restore(recs, assume_yes="--yes" in sys.argv or "-y" in sys.argv):
+            launch_many(recs)
+        return
+    if "--list" in sys.argv:
+        for r in collect(show_all):
+            age = "new" if r.get("new") else ago(r["mtime"])
+            print(f"{r['sid']}\t{age}\t{r['cwd']}\t{r['title'] or '(new session)'}\t{r['turns']}t")
+        return
+
+    if os.environ.get("CLAUDECODE"):
+        print("note: running inside a Claude Code session — 'ctrl-e' (this tab) would nest.",
+              file=sys.stderr)
+
+    header = ("enter=new tab  ctrl-w=new window  ctrl-e=this tab  tab=mark several  ctrl-r=restore last day  esc=quit"
+              if WT else "enter=resume here  esc=quit")
+
+    while True:
+        rows = collect()
+        if not rows:
+            print("No Claude Code sessions found under ~/.claude/projects", file=sys.stderr)
+            sys.exit(1)
+
+        lines = []
+        for r in rows:
+            proj = os.path.basename(r["cwd"]) or r["cwd"] or "?"
+            gone = "" if (r["cwd"] and os.path.isdir(r["cwd"])) else " \033[31m[missing]\033[0m"
+            br = r["branch"]
+            br = f" \033[33m({br})\033[0m" if br and br != "HEAD" else ""
+            if r.get("new"):
+                lines.append(f"{r['sid']}\t\033[2m new\033[0m  \033[36m{proj[:18]:<18}\033[0m{br} "
+                             f"\033[32m▸ new session\033[0m \033[2m{r['title']}\033[0m")
+                continue
+            lines.append(
+                f"{r['sid']}\t\033[2m{ago(r['mtime']):>4}\033[0m  "
+                f"\033[36m{proj[:18]:<18}\033[0m{br} \033[1m{r['title'][:56]}\033[0m"
+                f" \033[2m· {r['turns']}t\033[0m{gone}"
+            )
+
+        fzf = subprocess.run(
+            ["fzf", "--ansi", "--with-nth=2..", "--delimiter=\t",
+             "--height=90%", "--reverse", "--border",
+             "--prompt=session> ", f"--header={header}",
+             "--expect=ctrl-w,ctrl-e,ctrl-r", "--multi",
+             "--preview", f"{SELF} --preview {{1}} 2>/dev/null || true",
+             "--preview-window=down:60%:wrap"],
+            input="\n".join(lines), capture_output=True, text=True,
+        )
+        if fzf.returncode != 0 or not fzf.stdout.strip():
+            return
+
+        # --expect puts the pressed key on line 0 ("" for plain Enter)
+        out = fzf.stdout.split("\n")
+        key = out[0].strip()
+        if key == "ctrl-r":
+            recs = restore_set(rows)
+            if confirm_restore(recs):
+                launch_many(recs)
+            continue
+        sels = [l.split("\t")[0].strip() for l in out[1:] if l.strip()]
+        recs = [r for sid in sels for r in rows if r["sid"] == sid]
+        if not recs:
+            return
+
+        mode = {"": "tab", "ctrl-w": "window", "ctrl-e": "here"}.get(key, "tab")
+        if len(recs) > 1 and mode != "window":
+            launch_many(recs)          # several marked: one tab each
+            continue
+        for rec in recs:
+            launch(rec, mode)          # 'here' never returns
+
+
+if __name__ == "__main__":
+    main()
