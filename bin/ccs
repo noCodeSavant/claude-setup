@@ -42,12 +42,12 @@ def scan(path: Path, cache: dict):
     """Extract session metadata, using mtime+size as the cache key."""
     st  = path.stat()
     key = str(path)
-    sig = f"{st.st_mtime_ns}:{st.st_size}"
+    sig = f"{st.st_mtime_ns}:{st.st_size}:2"   # :2 = cache format with custom titles
     hit = cache.get(key)
     if hit and hit.get("sig") == sig:
         return hit
 
-    title = cwd = branch = ""
+    title = custom = cwd = branch = ""
     prompt = ""
     n_user = n_asst = 0
     sidechain = False
@@ -56,6 +56,12 @@ def scan(path: Path, cache: dict):
     try:
         with path.open(errors="replace") as fh:
             for line in fh:
+                if '"custom-title"' in line:   # /rename wins over the AI title
+                    try:
+                        custom = json.loads(line).get("customTitle") or custom
+                    except Exception:
+                        pass
+                    continue
                 if '"ai-title"' in line:
                     try:
                         title = json.loads(line).get("aiTitle") or title
@@ -104,7 +110,7 @@ def scan(path: Path, cache: dict):
         pass
     rec = {
         "sig": sig, "sid": path.stem, "file": str(path),
-        "title": title or prompt or "(untitled)",
+        "title": custom or title or prompt or "(untitled)",
         "prompt": prompt, "cwd": cwd, "branch": branch,
         "mtime": mtime, "turns": n_user, "replies": n_asst,
         "sidechain": sidechain, "entrypoint": entrypoint,
