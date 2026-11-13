@@ -235,20 +235,19 @@ def running_sids():
 
 
 def restore_set(rows, hours=24.0):
-    """The sessions to bring back: the newest session of every project that saw activity in the
-    `hours` before the most recent activity anywhere (= your last working day)."""
+    """The sessions to bring back: every session that saw activity in the `hours` before the most
+    recent activity anywhere (= your last working day). Several in one project all come back."""
     real = [r for r in rows if not r.get("new") and r["cwd"] and os.path.isdir(r["cwd"])]
     if not real:
         return []
     newest = max(r["mtime"] for r in real)
     live = running_sids()
-    picked, seen = [], set()
+    picked = []
     for r in sorted(real, key=lambda r: r["mtime"], reverse=True):   # newest first
         if newest - r["mtime"] > hours * 3600:
             break
-        if r["cwd"] in seen or r["sid"] in live:
-            continue
-        seen.add(r["cwd"]); picked.append(r)
+        if r["sid"] not in live:
+            picked.append(r)
     return picked
 
 
