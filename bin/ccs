@@ -300,7 +300,7 @@ def launch(rec, mode):
     subprocess.Popen(
         [WT, "-w", "0" if mode == "tab" else "-1", "new-tab",
          "--profile", "Ubuntu",
-         "--title", os.path.basename(cwd) or "claude",
+         "--title", f"{os.path.basename(cwd) or 'claude'} · {rec.get('title') or 'new'}"[:48],
          "wsl.exe", "-d", "Ubuntu", "--cd", cwd, "--", "bash", "-lic", cmd],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
     )
